@@ -1,0 +1,615 @@
+// ============================================================
+// ESP32 TX v3.1.0 - FULL FEATURED FIRMWARE
+// Tea/Lunch Alerts + Walkie-Talkie + Handshake + Captive Portal
+// NeoPixel (GPIO2 + GPIO14) + Buzzer + OLED + I2S Mic/Speaker
+// AUDIO: Exact working reference pattern (sample-by-sample, stereo frame)
+// v2.6.0: Tea/Lunch alerts play RAW audio via I2S speaker
+// v3.0.0: Fix LED color on no-handshake error (RED->GREEN); PTT stop LED off
+// v3.1.0: Tea/Lunch audio plays on RX side only (removed TX local playback)
+//         Blue LED on TX turns OFF after receiving PTT voice packet ends
+// ============================================================
+
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <WiFiUDP.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+#include <driver/i2s.h>
+#include <Adafruit_NeoPixel.h>
+
+// ===== VERSION =====
+const char* SW_VERSION = "TX_V3.1.0";
+
+// ===== PINS =====
+#define BUTTON_TEA_PIN         32
+#define BUTTON_LUNCH_PIN       35   // External 10k pull-up
+#define BUTTON_PTT_PIN         33
+#define ANALOG_PIN             34
+
+// I2S Speaker (MAX98357A)
+#define I2S_SPK_LRC            25
+#define I2S_SPK_BCLK           26
+#define I2S_SPK_DIN            27
+
+// I2S Microphone (INMP441)
+#define I2S_MIC_SD             19
+#define I2S_MIC_WS             18
+#define I2S_MIC_SCK             5
+// INMP441 L/R pin -> GND (Left channel)
+
+// Display I2C
+#define OLED_SDA_PIN           21
+#define OLED_SCL_PIN           22
+#define OLED_I2C_ADDRESS     0x3C
+#define SCREEN_WIDTH          128
+#define SCREEN_HEIGHT          64
+
+// Indicators
+#define BUZZER_PIN             13
+#define NEOPIXEL_PIN_1          2
+#define NEOPIXEL_PIN_2         14
+#define NUM_PIXELS              1
+
+// ===== COLORS =====
+#define COLOR_OFF      0x000000UL
+#define COLOR_GREEN    0x00FF00UL
+#define COLOR_BLUE     0x0000FFUL
+#define COLOR_RED      0xFF0000UL
+#define COLOR_YELLOW   0xFFFF00UL
+#define COLOR_WHITE    0xFFFFFFUL
+#define COLOR_PINK     0xFF69B4UL
+#define COLOR_CYAN     0x00FFFFUL
+#define COLOR_ORANGE   0xFF6600UL
+
+// ===== AUDIO =====
+// Speaker -> I2S_NUM_0  |  Mic -> I2S_NUM_1  (matches working reference)
+#define SAMPLE_RATE          16000
+#define I2S_PORT_SPK      I2S_NUM_0
+#define I2S_PORT_MIC      I2S_NUM_1
+#define AUDIO_PACKET_SIZE    560    // number of int16 mono samples per UDP packet
+
+// ===== PROTOCOL =====
+#define MSG_HEARTBEAT         0
+#define MSG_TEA               2
+#define MSG_LUNCH             1
+#define MSG_VOICE             3
+#define MSG_HANDSHAKE_REQ    10
+#define MSG_HANDSHAKE_ACK    11
+#define MSG_CALL_ACK         99
+#define MSG_HB_ACK           88
+
+// ===== UDP PORTS =====
+#define TX_LISTEN_PORT      4213
+#define RX_TARGET_PORT      4212
+
+// ===== TIMING =====
+#define HEARTBEAT_INTERVAL   3000UL
+#define COMM_LOSS_TIMEOUT   5000UL
+#define HANDSHAKE_INTERVAL   5000UL
+#define WIFI_PORTAL_HOLD     4000UL
+#define CALL_RETRY_COUNT        3
+#define CALL_RETRY_WAIT       700
+
+// ===== VOICE RX IDLE TIMEOUT =====
+// After the last voice packet arrives, clear the blue LED after this many ms
+#define VOICE_RX_IDLE_MS     400UL
+
+// ===== OBJECTS =====
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_NeoPixel pixel1(NUM_PIXELS, NEOPIXEL_PIN_1, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel pixel2(NUM_PIXELS, NEOPIXEL_PIN_2, NEO_GRB + NEO_KHZ800);
+WiFiUDP Udp;
+
+// ===== CONFIG =====
+char tx_ip_char[16]   = "192.168.31.136";
+char rx_ip_char[16]   = "192.168.31.104";
+char gateway_char[16] = "192.168.31.1";
+char subnet_char[16]  = "255.255.255.0";
+bool shouldSaveConfig = false;
+
+// ===== PACKET =====
+// audio[] holds AUDIO_PACKET_SIZE int16 mono samples as raw bytes
+typedef struct {
+  uint8_t  msg_type;
+  uint16_t seq;
+  uint8_t  audio[AUDIO_PACKET_SIZE * 2];
+} udp_packet_t;
+
+udp_packet_t txPkt, rxPkt;
+
+// ===== STATE =====
+bool isHandshakeDone    = false;
+bool isTransmitting     = false;
+
+unsigned long lastHandshakeTime  = 0;
+unsigned long lastAckTime        = 0;
+unsigned long lunchBtnPressStart = 0;
+unsigned long teaBtnPressStart   = 0;
+unsigned long packetSeq          = 0;
+
+// v3.1.0: track when the last incoming voice packet arrived so we can
+// extinguish the blue LED after the remote PTT is released
+unsigned long lastVoiceRxTime    = 0;
+bool          isVoiceRxActive    = false;
+
+// ===== NEOPIXEL =====
+void setLEDs(uint32_t c) {
+  pixel1.setPixelColor(0, c); pixel1.show();
+  pixel2.setPixelColor(0, c); pixel2.show();
+}
+void blinkLEDs(uint32_t c, int n, int ms) {
+  for (int i = 0; i < n; i++) {
+    setLEDs(c); delay(ms);
+    setLEDs(COLOR_OFF); delay(ms);
+  }
+}
+
+// ===== BUZZER =====
+void buzzerBeep(uint16_t ms) {
+  digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW);
+}
+void buzzerBeeps(int n, int d, int g) {
+  for (int i = 0; i < n; i++) { buzzerBeep(d); if (i < n-1) delay(g); }
+}
+void buzzerLong(int ms) {
+  digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ===== DISPLAY =====
+void dispMsg(const char* l1, const char* l2="", const char* l3="", const char* l4="") {
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);  display.println(SW_VERSION);
+  display.println("----");
+  display.println(l1);
+  if (strlen(l2)) display.println(l2);
+  if (strlen(l3)) display.println(l3);
+  if (strlen(l4)) display.println(l4);
+  display.display();
+}
+
+void drawLiveStatus() {
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);  display.println("TX DEVICE");
+  display.setCursor(0, 10); display.print("IP:"); display.println(WiFi.localIP());
+  display.setCursor(0, 20); display.print("WiFi:");
+  if (WiFi.status() == WL_CONNECTED) display.println(WiFi.SSID());
+  else                               display.println("OFFLINE");
+  display.setCursor(0, 30);
+  if      (WiFi.status() != WL_CONNECTED) display.println("Status: NO WIFI");
+  else if (!isHandshakeDone)              display.println("Status: NO HANDSHAKE");
+  else if (isTransmitting)               display.println("Status: TRANSMITTING");
+  else                                   display.println("Status: READY");
+  display.setCursor(0, 40); display.println("Tea  Lunch");
+  display.setCursor(0, 50); display.println("PTT  AP MODE");
+  if (WiFi.status() == WL_CONNECTED) {
+    int rssi = WiFi.RSSI();
+    display.drawCircle(120, 8, 4, SSD1306_WHITE);
+    if      (rssi > -65) { display.drawCircle(120,8,3,SSD1306_WHITE); display.drawCircle(120,8,2,SSD1306_WHITE); }
+    else if (rssi > -80)   display.drawCircle(120,8,3,SSD1306_WHITE);
+    display.drawPixel(120, 8, SSD1306_WHITE);
+  } else {
+    display.drawLine(116,4,124,12,SSD1306_WHITE);
+    display.drawLine(116,12,124,4,SSD1306_WHITE);
+  }
+  display.display();
+}
+
+// ===== CONFIG =====
+void saveConfigCallback() { shouldSaveConfig = true; }
+
+bool loadConfig() {
+  if (!SPIFFS.begin(true)) return false;
+  File f = SPIFFS.open("/config.json", "r");
+  if (!f) { SPIFFS.end(); return false; }
+  JsonDocument doc;
+  if (deserializeJson(doc, f)) { f.close(); SPIFFS.end(); return false; }
+  f.close();
+  strlcpy(tx_ip_char,   doc["tx_ip"] | "192.168.31.136", 16);
+  strlcpy(rx_ip_char,   doc["rx_ip"] | "192.168.31.104", 16);
+  strlcpy(gateway_char, doc["gw"]    | "192.168.31.1",   16);
+  strlcpy(subnet_char,  doc["sn"]    | "255.255.255.0",  16);
+  SPIFFS.end(); Serial.println("[Config] Loaded."); return true;
+}
+
+bool saveConfig() {
+  if (!SPIFFS.begin(true)) return false;
+  JsonDocument doc;
+  doc["tx_ip"] = tx_ip_char; doc["rx_ip"] = rx_ip_char;
+  doc["gw"]    = gateway_char; doc["sn"]   = subnet_char;
+  File f = SPIFFS.open("/config.json", "w");
+  if (!f) { SPIFFS.end(); return false; }
+  serializeJson(doc, f); f.close(); SPIFFS.end();
+  Serial.println("[Config] Saved."); return true;
+}
+
+// ===== CAPTIVE PORTAL =====
+void startCaptivePortal() {
+  dispMsg("WiFi Portal", "Connect to:", "ESP-TX-SETUP", "192.168.4.1");
+  setLEDs(COLOR_PINK); buzzerBeeps(2, 200, 100);
+  WiFiManager wm;
+  wm.setSaveConfigCallback(saveConfigCallback);
+  WiFiManagerParameter p_tx("tx_ip", "TX IP (self)", tx_ip_char, 16);
+  WiFiManagerParameter p_rx("rx_ip", "RX IP",        rx_ip_char, 16);
+  WiFiManagerParameter p_gw("gw",    "Gateway",      gateway_char, 16);
+  WiFiManagerParameter p_sn("sn",    "Subnet",       subnet_char, 16);
+  wm.addParameter(&p_tx); wm.addParameter(&p_rx);
+  wm.addParameter(&p_gw); wm.addParameter(&p_sn);
+  wm.setConfigPortalTimeout(300);
+  wm.startConfigPortal("ESP-TX-SETUP");
+  if (shouldSaveConfig) {
+    strlcpy(tx_ip_char,   p_tx.getValue(), 16);
+    strlcpy(rx_ip_char,   p_rx.getValue(), 16);
+    strlcpy(gateway_char, p_gw.getValue(), 16);
+    strlcpy(subnet_char,  p_sn.getValue(), 16);
+    saveConfig();
+  }
+  setLEDs(COLOR_OFF); ESP.restart();
+}
+
+// ===== I2S SETUP =====
+// Both configs are IDENTICAL to the working reference code — no changes.
+
+void setupSpeaker() {
+  i2s_config_t spk_config = {
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate          = SAMPLE_RATE,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 8,
+    .dma_buf_len          = 128,
+    .use_apll             = false,
+    .tx_desc_auto_clear   = true,
+    .fixed_mclk           = 0
+  };
+  i2s_pin_config_t spk_pins = {
+    .bck_io_num   = I2S_SPK_BCLK,
+    .ws_io_num    = I2S_SPK_LRC,
+    .data_out_num = I2S_SPK_DIN,
+    .data_in_num  = I2S_PIN_NO_CHANGE
+  };
+  i2s_driver_install(I2S_PORT_SPK, &spk_config, 0, NULL);
+  i2s_set_pin(I2S_PORT_SPK, &spk_pins);
+  Serial.println("[I2S] Speaker ready (I2S_NUM_0, stereo 16-bit)");
+}
+
+void setupMic() {
+  i2s_config_t mic_config = {
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate          = SAMPLE_RATE,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 8,
+    .dma_buf_len          = 128,
+    .use_apll             = false,
+    .tx_desc_auto_clear   = false,
+    .fixed_mclk           = 0
+  };
+  i2s_pin_config_t mic_pins = {
+    .bck_io_num   = I2S_MIC_SCK,
+    .ws_io_num    = I2S_MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num  = I2S_MIC_SD
+  };
+  i2s_driver_install(I2S_PORT_MIC, &mic_config, 0, NULL);
+  i2s_set_pin(I2S_PORT_MIC, &mic_pins);
+  Serial.println("[I2S] Mic ready (I2S_NUM_1, 32-bit left)");
+}
+
+// ===== SPEAKER WRITE — exact working reference pattern =====
+// Takes one int16 mono sample, writes as stereo frame {L, R}
+void writeSpeakerSample(int16_t s) {
+  size_t bw = 0;
+  int16_t out_frame[2] = { s, s };
+  i2s_write(I2S_PORT_SPK, &out_frame, sizeof(out_frame), &bw, portMAX_DELAY);
+}
+
+// ===== UDP SEND =====
+bool sendUDP(uint8_t msgType, const uint8_t* audioData = nullptr) {
+  IPAddress rxIP;
+  if (!rxIP.fromString(rx_ip_char)) { Serial.println("[UDP] Invalid RX IP"); return false; }
+  txPkt.msg_type = msgType;
+  txPkt.seq      = (uint16_t)(packetSeq++ & 0xFFFF);
+  if (audioData) memcpy(txPkt.audio, audioData, sizeof(txPkt.audio));
+  else           memset(txPkt.audio, 0,          sizeof(txPkt.audio));
+  Udp.beginPacket(rxIP, RX_TARGET_PORT);
+  Udp.write((uint8_t*)&txPkt, sizeof(txPkt));
+  return Udp.endPacket();
+}
+
+// ===== HANDSHAKE =====
+void doHandshake() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  Serial.println("[Handshake] Sending REQ...");
+  sendUDP(MSG_HANDSHAKE_REQ);
+  lastHandshakeTime = millis();
+}
+
+// ===== SEND CALL WITH ACK WAIT =====
+// v3.1.0: Local audio playback on TX speaker REMOVED.
+// Tea/Lunch audio is now played exclusively on the RX device speaker
+// when the alert arrives there (handled in RX startAlert()).
+// All original retry / ACK / buzzer / LED logic is completely unchanged.
+bool sendCallWithAck(uint8_t callType) {
+  if (WiFi.status() != WL_CONNECTED) { dispMsg("ERROR", "WiFi Offline"); return false; }
+  if (!isHandshakeDone) {
+    dispMsg("ERROR", "No Handshake!", "Try again...");
+    buzzerLong(500);
+    setLEDs(COLOR_GREEN); delay(1000); setLEDs(COLOR_OFF);
+    return false;
+  }
+  const char* name = (callType == MSG_TEA) ? "TEA TIME" : "LUNCH TIME";
+
+  dispMsg(name, "Sending alert...", "Awaiting ACK...");
+  setLEDs(COLOR_YELLOW);
+  for (int retry = 0; retry < CALL_RETRY_COUNT; retry++) {
+    Serial.printf("[Call] type %d try %d\n", callType, retry+1);
+    sendUDP(callType);
+    unsigned long t0 = millis();
+    while (millis()-t0 < CALL_RETRY_WAIT) {
+      int sz = Udp.parsePacket();
+      if (sz >= (int)sizeof(udp_packet_t)) {
+        Udp.read((uint8_t*)&rxPkt, sizeof(rxPkt));
+        if (rxPkt.msg_type == MSG_CALL_ACK) {
+          lastAckTime = millis();
+          dispMsg(name, "ACK RECEIVED!", "Alert delivered.");
+          setLEDs(COLOR_GREEN); buzzerBeeps(3, 100, 80);
+          delay(1000); setLEDs(COLOR_OFF);
+          return true;
+        }
+      }
+      yield(); delay(10);
+    }
+  }
+  dispMsg("CALL TIMEOUT", "No ACK received.", "Check RX device.");
+  setLEDs(COLOR_GREEN); buzzerLong(1000); delay(1000); setLEDs(COLOR_OFF);
+  Serial.println("[Call] TIMEOUT.");
+  return false;
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.printf("\n\n===== %s STARTUP =====\n", SW_VERSION);
+
+  pinMode(BUTTON_TEA_PIN,   INPUT_PULLUP);
+  pinMode(BUTTON_LUNCH_PIN, INPUT);
+  pinMode(BUTTON_PTT_PIN,   INPUT_PULLUP);
+  pinMode(BUZZER_PIN,       OUTPUT);
+  digitalWrite(BUZZER_PIN,  LOW);
+
+  pixel1.begin(); pixel1.setBrightness(80); pixel1.clear(); pixel1.show();
+  pixel2.begin(); pixel2.setBrightness(80); pixel2.clear(); pixel2.show();
+  setLEDs(COLOR_WHITE); delay(400); setLEDs(COLOR_OFF);
+
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS))
+    Serial.println("[OLED] Init failed");
+  dispMsg("Starting...", "Loading config...");
+
+  if (!SPIFFS.begin(true)) Serial.println("[SPIFFS] Mount failed, using defaults");
+  loadConfig();
+
+  WiFiManager wm;
+  wm.setSaveConfigCallback(saveConfigCallback);
+  WiFiManagerParameter p_tx("tx_ip", "TX IP (self)", tx_ip_char, 16);
+  WiFiManagerParameter p_rx("rx_ip", "RX IP",        rx_ip_char, 16);
+  WiFiManagerParameter p_gw("gw",    "Gateway",      gateway_char, 16);
+  WiFiManagerParameter p_sn("sn",    "Subnet",       subnet_char, 16);
+  wm.addParameter(&p_tx); wm.addParameter(&p_rx);
+  wm.addParameter(&p_gw); wm.addParameter(&p_sn);
+
+  IPAddress txIP, gwIP, snIP;
+  txIP.fromString(tx_ip_char);
+  gwIP.fromString(gateway_char);
+  snIP.fromString(subnet_char);
+  wm.setSTAStaticIPConfig(txIP, gwIP, snIP);
+  wm.setConnectTimeout(25);
+  wm.setConfigPortalTimeout(180);
+
+  dispMsg("Connecting...", "WiFi...");
+  if (!wm.autoConnect("ESP-TX-SETUP")) {
+    dispMsg("WIFI FAILED", "Restarting..."); delay(3000); ESP.restart();
+  }
+
+  if (shouldSaveConfig) {
+    strlcpy(tx_ip_char,   p_tx.getValue(), 16);
+    strlcpy(rx_ip_char,   p_rx.getValue(), 16);
+    strlcpy(gateway_char, p_gw.getValue(), 16);
+    strlcpy(subnet_char,  p_sn.getValue(), 16);
+    saveConfig(); delay(500); ESP.restart();
+  }
+
+  Serial.printf("[WiFi] TX IP: %s  RX: %s\n", WiFi.localIP().toString().c_str(), rx_ip_char);
+
+  // Speaker first, then mic — same order as working reference
+  setupSpeaker();
+  setupMic();
+
+  Udp.begin(TX_LISTEN_PORT);
+  Serial.printf("[UDP] Listening on port %d\n", TX_LISTEN_PORT);
+
+  lastAckTime       = millis();
+  lastHandshakeTime = 0;
+
+  dispMsg("Connected!", "Ready.", rx_ip_char);
+  blinkLEDs(COLOR_GREEN, 3, 150);
+  Serial.println("===== TX READY =====\n");
+}
+
+// ===== LOOP =====
+void loop() {
+  static unsigned long lastDisplayUpdate = 0;
+  static unsigned long lastHBTime        = 0;
+
+  // Persistent PTT audio accumulation buffer (survives loop iterations)
+  static int16_t audioBuf[AUDIO_PACKET_SIZE];
+  static int     audioBufIdx = 0;
+
+  // ---- WiFi check ----
+  if (WiFi.status() != WL_CONNECTED) {
+    isHandshakeDone  = false;
+    isVoiceRxActive  = false;
+    setLEDs(COLOR_RED);
+    dispMsg("WiFi Lost", "Reconnecting...");
+    WiFi.begin(); delay(3000); return;
+  }
+
+  // ---- Periodic handshake attempt ----
+  if (!isHandshakeDone && millis()-lastHandshakeTime > HANDSHAKE_INTERVAL)
+    doHandshake();
+
+  // ---- Periodic heartbeat ----
+  if (isHandshakeDone && millis()-lastHBTime > HEARTBEAT_INTERVAL) {
+    sendUDP(MSG_HEARTBEAT);
+    lastHBTime = millis();
+    Serial.println("[HB] Sent.");
+  }
+
+  // ---- Incoming UDP ----
+  int pktSz = Udp.parsePacket();
+  if (pktSz >= (int)sizeof(udp_packet_t)) {
+    Udp.read((uint8_t*)&rxPkt, sizeof(rxPkt));
+
+    if (rxPkt.msg_type == MSG_HANDSHAKE_ACK) {
+      if (!isHandshakeDone) {
+        isHandshakeDone = true;
+        lastAckTime = millis();
+        Serial.println("[Handshake] SUCCESS!");
+        dispMsg("HANDSHAKE OK", "Link established!");
+        blinkLEDs(COLOR_GREEN, 2, 200); delay(800);
+      }
+
+    } else if (rxPkt.msg_type == MSG_HB_ACK || rxPkt.msg_type == MSG_CALL_ACK) {
+      lastAckTime = millis();
+
+    } else if (rxPkt.msg_type == MSG_VOICE) {
+      // Play received voice — exact working reference pattern.
+      // Blue LED on while voice is coming in; turns OFF once packets stop
+      // (detected by VOICE_RX_IDLE_MS timeout below — no delay needed here).
+      int16_t* samples = (int16_t*)rxPkt.audio;
+      for (int i = 0; i < AUDIO_PACKET_SIZE; i++) {
+        writeSpeakerSample(samples[i]);
+      }
+      // v3.1.0: set LED blue and stamp the arrival time
+      setLEDs(COLOR_BLUE);
+      lastVoiceRxTime = millis();
+      isVoiceRxActive = true;
+    }
+  }
+
+  // ---- v3.1.0: Blue LED idle-off after incoming PTT ends ----
+  // When the remote PTT is released, voice packets stop arriving.
+  // After VOICE_RX_IDLE_MS of silence we extinguish the blue LED.
+  if (isVoiceRxActive && !isTransmitting &&
+      (millis() - lastVoiceRxTime) > VOICE_RX_IDLE_MS) {
+    isVoiceRxActive = false;
+    setLEDs(COLOR_OFF);
+    Serial.println("[Voice RX] Stream ended — LED off.");
+  }
+
+  // ---- Comm loss check ----
+  if (isHandshakeDone && millis()-lastAckTime > COMM_LOSS_TIMEOUT) {
+    isHandshakeDone = false;
+    Serial.println("[COMM] Loss detected.");
+    setLEDs(COLOR_ORANGE);
+    dispMsg("COMM LOSS", "Re-handshaking...");
+    delay(500); setLEDs(COLOR_OFF);
+  }
+
+  // ---- TEA button (GPIO32) ----
+  if (digitalRead(BUTTON_TEA_PIN) == LOW) {
+    if (teaBtnPressStart == 0) teaBtnPressStart = millis();
+  } else {
+    if (teaBtnPressStart > 0) {
+      if (millis()-teaBtnPressStart < 3000) {
+        Serial.println("[BTN] Tea pressed");
+        sendCallWithAck(MSG_TEA);
+      }
+      teaBtnPressStart = 0;
+    }
+  }
+
+  // ---- LUNCH button (GPIO35) ----
+  if (digitalRead(BUTTON_LUNCH_PIN) == LOW) {
+    if (lunchBtnPressStart == 0) lunchBtnPressStart = millis();
+    else if (millis()-lunchBtnPressStart >= WIFI_PORTAL_HOLD) {
+      lunchBtnPressStart = 0;
+      startCaptivePortal();
+    }
+  } else {
+    if (lunchBtnPressStart > 0) {
+      if (millis()-lunchBtnPressStart < WIFI_PORTAL_HOLD) {
+        Serial.println("[BTN] Lunch pressed");
+        sendCallWithAck(MSG_LUNCH);
+      }
+      lunchBtnPressStart = 0;
+    }
+  }
+
+  // ---- PTT button (GPIO33) — Walkie-talkie TX ----
+  //
+  // MIC READ uses the EXACT same pattern as the working reference:
+  //   i2s_read() one int32 at a time
+  //   processed = raw >> 15
+  //   clamp to int16 range
+  //
+  // Samples are accumulated into audioBuf then transmitted as UDP voice packet.
+  //
+  if (digitalRead(BUTTON_PTT_PIN) == LOW) {
+    if (!isHandshakeDone) { delay(5); goto skip_ptt; }
+
+    if (!isTransmitting) {
+      isTransmitting  = true;
+      isVoiceRxActive = false;   // cancel any lingering blue LED if we start TX
+      audioBufIdx     = 0;
+      setLEDs(COLOR_GREEN);
+    }
+
+    // --- Exact working reference read pattern ---
+    size_t    bytes_read = 0;
+    int32_t   mic_sample = 0;
+    esp_err_t res = i2s_read(I2S_PORT_MIC, &mic_sample, sizeof(mic_sample), &bytes_read, portMAX_DELAY);
+
+    if (res == ESP_OK && bytes_read > 0) {
+      int32_t processed = mic_sample >> 15;
+      if (processed >  32767) processed =  32767;
+      if (processed < -32768) processed = -32768;
+      int16_t spk_sample = (int16_t)processed;
+
+      audioBuf[audioBufIdx++] = spk_sample;
+      if (audioBufIdx >= AUDIO_PACKET_SIZE) {
+        audioBufIdx = 0;
+        sendUDP(MSG_VOICE, (uint8_t*)audioBuf);
+      }
+    }
+
+  } else {
+    if (isTransmitting) {
+      isTransmitting = false;
+      audioBufIdx    = 0;
+      // LED always turns OFF when PTT is released
+      setLEDs(COLOR_OFF);
+    }
+  }
+
+skip_ptt:
+
+  // ---- Display update (1 Hz) ----
+  if (!isTransmitting && millis()-lastDisplayUpdate > 1000) {
+    drawLiveStatus();
+    lastDisplayUpdate = millis();
+  }
+
+  yield();
+}
