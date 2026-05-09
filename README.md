@@ -54,57 +54,36 @@ A high-performance ESP32-based communication device featuring Push-To-Talk (PTT)
 
 
 
-# ESP32 Walkie-Talkie & Industrial Alert System (v3.1.0)
+# ESP32 RX v3.1.0 - Smart Intercom & Alert Receiver
 
-A high-performance communication system using two ESP32 nodes (TX and RX). This project features low-latency Push-To-Talk (PTT) voice streaming, dedicated "Tea" and "Lunch" alerts with acknowledgement tracking, and a captive portal for easy network configuration.
+## ✨ Features
+- **Walkie-Talkie:** Half-duplex voice communication using I2S ( Mic & Amplifier Speaker).
+- **Smart Alerts:** Plays `.raw` audio files for "Tea" and "Lunch" notifications with visual LED feedback.
+- **Captive Portal:** Long-press the Mute button to trigger a WiFi configuration portal (ip address).
+- **Visual Feedback:** Dual NeoPixel indicators and  OLED status display.
+- **Robust Networking:** Automatic handshake and communication loss detection.
 
-## 🚀 System Overview
-- **TX Device:** The "Remote" unit used to send voice and trigger alerts.
-- **RX Device:** The "Station" unit that receives voice and plays custom audio alerts from its internal storage (SPIFFS).
-- **Protocol:** UDP-based sample-by-sample 16kHz audio streaming.
+## 🛠 Hardware Mapping (GPIO)
+| Component | Pin(s) |
+|-----------|--------|
+| **NeoPixels** | GPIO 2, GPIO 14 |
+| **Buzzer** | GPIO 13 |
+| **I2S Speaker (LRC/BCLK/DIN)** | 25, 26, 27 |
+| **I2S Mic (SD/WS/SCK)** | 19, 18, 5 |
+| **Buttons (Mute/PTT)** | 32, 33 |
+| **OLED (SDA/SCL)** | 21, 22 |
 
-## ✨ Key Features (v3.1.0)
-- **Voice Streaming:** I2S Microphone (INMP441) to I2S Speaker (MAX98357A) at 16,000Hz.
-- **RAW Audio Alerts:** RX plays high-quality `.raw` files (Tea/Lunch) directly from SPIFFS.
-- **Visual Feedback:** Dual NeoPixel indicators and SSD1306 OLED for real-time status.
-- **Smart Handshake:** Automated device linking and communication loss detection (Orange LED).
-- **Captive Portal:** Long-press the Lunch/Mute button to enter AP Mode (`192.168.4.1`) to configure Static IPs.
+## 🚀 Setup & Installation
+1. **SPIFFS Data:** You must upload the `tea.raw` and `lunch.raw` files to the ESP32 SPIFFS.
+   - Format: 16-bit Signed PCM, Mono, 16000Hz.
+2. **Libraries Required:**
+   - `WiFiManager`
+   - `ArduinoJson`
+   - `Adafruit_SSD1306` & `Adafruit_GFX`
+   - `Adafruit_NeoPixel`
+3. **Configuration:** On first boot, connect to the `ESP-RX-SETUP` hotspot to configure static IPs and Gateway settings.
 
-## 🛠 Hardware Wiring Map
-
-| Component | Pin (GPIO) | Description |
-| :--- | :--- | :--- |
-| **I2S Speaker (DIN)** | 27 | MAX98357A Data Input |
-| **I2S Speaker (LRC)** | 25 | Left/Right Clock (WS) |
-| **I2S Speaker (BCLK)**| 26 | Bit Clock (SCK) |
-| **I2S Mic (SD)** | 19 | INMP441 Data Output |
-| **I2S Mic (WS)** | 18 | Word Select |
-| **I2S Mic (SCK)** | 5 | Serial Clock |
-| **OLED SDA / SCL** | 21 / 22 | I2C Display Pins |
-| **PTT Button** | 33 | Voice Transmission (Active Low) |
-| **Tea / Mute Pin** | 32 | Trigger Alert (TX) / Silence Alert (RX) |
-| **Lunch Button** | 35 | Trigger Alert (TX) / Portal Trigger |
-| **NeoPixels** | 2, 14 | Status Indicators (WS2812B) |
-| **Buzzer** | 13 | Audible Notifications |
-
-## 🔊 Audio Alert Setup (RX Only)
-The RX device plays custom audio clips for alerts. You must upload these to the ESP32 SPIFFS:
-1. **Format:** 16-bit signed PCM, Mono, 16000 Hz (Little Endian).
-2. **Filenames:** `tea.raw` and `lunch.raw`.
-3. **Upload:** Use the *ESP32 Sketch Data Upload* tool in the Arduino IDE.
-
-## 📟 Status LED Guide
-- **🔵 Blue (Steady):** Receiving incoming voice stream.
-- **🟢 Green (Pulse):** Handshake successful / Alert acknowledged.
-- **🟡 Yellow:** Alert active (Tea).
-- **🟠 Orange:** Alert active (Lunch) or Communication Loss.
-- **🔴 Red:** WiFi connection lost.
-
-## 📜 Version History
-### v3.1.0
-- **Optimized UI:** Added `VOICE_RX_IDLE_MS` to prevent LED flickering; blue LED now turns off cleanly after stream ends.
-- **Audio Logic:** Removed TX local playback to prioritize network speed.
-- **Buzzer:** Refined pulsing patterns for Lunch alerts.
-
-## 📄 License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+## 🔄 Version History
+- **v3.1.0:** Added blue LED timeout logic; confirmed local audio playback for alerts.
+- **v3.0.0:** Optimized PTT LED states and versioning.
+- **v2.6.0:** Integrated RAW audio playback via I2S.
