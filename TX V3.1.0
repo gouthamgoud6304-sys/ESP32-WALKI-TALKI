@@ -105,10 +105,10 @@ Adafruit_NeoPixel pixel2(NUM_PIXELS, NEOPIXEL_PIN_2, NEO_GRB + NEO_KHZ800);
 WiFiUDP Udp;
 
 // ===== CONFIG =====
-char tx_ip_char[16]   = "192.168.31.136";
-char rx_ip_char[16]   = "192.168.31.104";
-char gateway_char[16] = "192.168.31.1";
-char subnet_char[16]  = "255.255.255.0";
+char tx_ip_char[16]   = "ENTER TX IP ADDRESS";
+char rx_ip_char[16]   = "ENTER RX IP ADDRESS";
+char gateway_char[16] = "ENTER GATEWAY ADDRESS";
+char subnet_char[16]  = "ENTER SUBNET ADDRESS";
 bool shouldSaveConfig = false;
 
 // ===== PACKET =====
@@ -210,10 +210,10 @@ bool loadConfig() {
   JsonDocument doc;
   if (deserializeJson(doc, f)) { f.close(); SPIFFS.end(); return false; }
   f.close();
-  strlcpy(tx_ip_char,   doc["tx_ip"] | "192.168.31.136", 16);
-  strlcpy(rx_ip_char,   doc["rx_ip"] | "192.168.31.104", 16);
-  strlcpy(gateway_char, doc["gw"]    | "192.168.31.1",   16);
-  strlcpy(subnet_char,  doc["sn"]    | "255.255.255.0",  16);
+  strlcpy(tx_ip_char,   doc["tx_ip"] | "TX IP", 16);
+  strlcpy(rx_ip_char,   doc["rx_ip"] | "RX IP", 16);
+  strlcpy(gateway_char, doc["gw"]    | "GATEWAY ADDRESS",   16);
+  strlcpy(subnet_char,  doc["sn"]    | "SUBNET ADDRESS",  16);
   SPIFFS.end(); Serial.println("[Config] Loaded."); return true;
 }
 
@@ -230,7 +230,7 @@ bool saveConfig() {
 
 // ===== CAPTIVE PORTAL =====
 void startCaptivePortal() {
-  dispMsg("WiFi Portal", "Connect to:", "ESP-TX-SETUP", "192.168.4.1");
+  dispMsg("WiFi Portal", "Connect to:", "ESP-TX-SETUP", "PORTAL IP ADDRESS");
   setLEDs(COLOR_PINK); buzzerBeeps(2, 200, 100);
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
