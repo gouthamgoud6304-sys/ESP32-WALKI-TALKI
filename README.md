@@ -57,7 +57,7 @@ A high-performance ESP32-based communication device featuring Push-To-Talk (PTT)
 # ESP32 RX v3.1.0 - Smart Intercom & Alert Receiver
 
 ## ✨ Features
-- **Walkie-Talkie:** Half-duplex voice communication using I2S ( Mic & Amplifier Speaker).
+- **Walkie-Talkie:** full-duplex voice communication using I2S ( Mic & Amplifier Speaker).
 - **Smart Alerts:** Plays `.raw` audio files for "Tea" and "Lunch" notifications with visual LED feedback.
 - **Captive Portal:** Long-press the Mute button to trigger a WiFi configuration portal (ip address).
 - **Visual Feedback:** Dual NeoPixel indicators and  OLED status display.
